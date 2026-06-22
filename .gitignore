@@ -1,0 +1,80 @@
+# =========================
+# TrustMoE-Traj 项目级忽略规则
+# 日期：2026-04-22
+# =========================
+
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+
+# Virtual environment / IDE
+.venv/
+venv/
+.idea/
+.vscode/
+.codegraph/
+
+# Logs / checkpoints / temporary artifacts
+*.log
+*.tmp
+*.bak
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npy
+*.npz
+*.docx
+*.pdf
+*.wandb
+checkpoints/
+outputs/
+runs/
+wandb/
+**/wandb/
+**/checkpoint/
+**/checkpoints/
+trustmoe_traj/analysis/experiment_runs/
+trustmoe_traj/analysis/**
+/data_results/
+/tmp_latex_check/
+asset_files_*.txt
+asset_manifest_*.tsv
+
+# Local notes, experiment ledgers, and manuscript workspaces.
+# Keep the public repository entry points visible.
+/*.md
+!/README.md
+/实验结果.txt
+
+# Figure outputs are large by default. Keep only README-facing preview assets
+# that should render on a public repository page.
+
+# -------------------------------------------------
+# TrustMoE-Traj 原始数据目录
+# 说明：不忽略 trustmoe_traj/data 下的代码文件，仅忽略原始 ETH 数据内容
+# 保留 README，方便目录结构与说明被追踪
+# -------------------------------------------------
+trustmoe_traj/data/ETH/**
+!trustmoe_traj/data/ETH/
+!trustmoe_traj/data/ETH/README.md
+!trustmoe_traj/data/ETH/**/
+!trustmoe_traj/data/ETH/**/README.md
+
+# -------------------------------------------------
+# 原始参考项目目录
+# 说明：这些目录当前作为参考工程来源，先不纳入新主工程版本管理范围
+# 风险：后续如果你希望正式跟踪其中代码改动，需要再调整本文件
+# -------------------------------------------------
+mdn_trajectory_forecasting/
+MoFlow/
+Tra-MoE/
+moflow_writing/
+参考/
+论文草稿/
+文章/
+claude历史对话记录/
+历史对话记录/

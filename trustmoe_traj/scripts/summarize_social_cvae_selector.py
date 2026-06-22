@@ -1,0 +1,252 @@
+"""Aggregate SocialCVAE group selector outputs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+METRICS: Sequence[str] = ("ADE_min", "FDE_min", "ADE_avg", "FDE_avg", "MissRate")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Summarize SocialCVAE group selector outputs.")
+    parser.add_argument("--project-root", type=str, default=str(PROJECT_ROOT))
+    parser.add_argument("--run-prefix", type=str, required=True)
+    parser.add_argument("--run-name", type=str, default="social_cvae_selector")
+    parser.add_argument("--eval-file-prefix", type=str, default="v25a_official")
+    parser.add_argument("--seeds", type=str, default="0")
+    parser.add_argument("--splits", type=str, default="val,test")
+    parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument("--output-txt", type=str, default=None)
+    return parser
+
+
+def _split_items(raw: str) -> List[str]:
+    return [item for item in raw.replace(",", " ").split() if item]
+
+
+def _split_ints(raw: str) -> List[int]:
+    return [int(item) for item in _split_items(raw)]
+
+
+def _load_json(path: Path) -> Optional[Mapping[str, Any]]:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _num(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mean(values: Iterable[Any]) -> Optional[float]:
+    nums = [item for item in (_num(value) for value in values) if item is not None]
+    if not nums:
+        return None
+    return float(sum(nums) / len(nums))
+
+
+def _fmt(value: Any, *, signed: bool = False) -> str:
+    numeric = _num(value)
+    if numeric is None:
+        return "None"
+    prefix = "+" if signed and numeric >= 0 else ""
+    return f"{prefix}{numeric:.6f}"
+
+
+def _metric(metrics: Mapping[str, Any], field: str, name: str) -> Optional[float]:
+    return _num(metrics.get(f"{field}_{name}"))
+
+
+def _run_id(prefix: str, seed: int) -> str:
+    return f"{prefix}_seed{seed}"
+
+
+def _seed_row(args: argparse.Namespace, project_root: Path, seed: int, splits: Sequence[str]) -> Dict[str, Any]:
+    run_id = _run_id(args.run_prefix, seed)
+    train_summary_path = (
+        project_root
+        / "trustmoe_traj"
+        / "analysis"
+        / "social_cvae_selector_models"
+        / run_id
+        / f"{args.run_name}_summary.json"
+    )
+    train_summary = _load_json(train_summary_path) or {}
+    row: Dict[str, Any] = {
+        "run_id": run_id,
+        "seed": int(seed),
+        "best_epoch": train_summary.get("meta", {}).get("best_epoch"),
+        "best_checkpoint": train_summary.get("meta", {}).get("best_checkpoint"),
+        "refiner_checkpoint": train_summary.get("meta", {}).get("refiner_checkpoint"),
+        "best_selection_score": train_summary.get("meta", {}).get("best_selection_score"),
+        "train_summary_missing": not train_summary_path.exists(),
+    }
+    best_val = train_summary.get("best_val_metrics", {})
+    if isinstance(best_val, Mapping):
+        row["cache_val_dFDE_min"] = best_val.get("dFDE_min")
+        row["cache_val_dMissRate"] = best_val.get("dMissRate")
+        row["cache_val_base_best_hurt_mean"] = best_val.get("base_best_hurt_mean")
+        row["cache_val_endpoint_ratio"] = best_val.get("endpoint_ratio")
+        row["cache_val_trajectory_ratio"] = best_val.get("trajectory_ratio")
+        row["cache_val_target_accuracy"] = best_val.get("target_accuracy")
+        row["cache_val_target_mean_ratio"] = best_val.get("target_mean_ratio")
+        row["cache_val_selected_mean_ratio"] = best_val.get("selected_mean_ratio")
+        row["cache_val_target_utility_gain"] = best_val.get("target_utility_gain")
+
+    missing: List[str] = []
+    for split in splits:
+        eval_path = (
+            project_root
+            / "trustmoe_traj"
+            / "analysis"
+            / "eval_results"
+            / run_id
+            / f"{args.eval_file_prefix}_{split}.json"
+        )
+        payload = _load_json(eval_path)
+        if payload is None:
+            missing.append(eval_path.as_posix())
+            metrics = {}
+        else:
+            metrics = payload.get("metrics", {})
+        split_row: Dict[str, Any] = {}
+        if isinstance(metrics, Mapping):
+            for metric in METRICS:
+                selected = _metric(metrics, "social_cvae_selector_pred", metric)
+                slow = _metric(metrics, "slow_pred", metric)
+                split_row[f"social_cvae_selector_{metric}"] = selected
+                split_row[f"slow_{metric}"] = slow
+                split_row[f"d{metric}"] = None if selected is None or slow is None else selected - slow
+            split_row["fast_FDE_min"] = _metric(metrics, "fast_pred", "FDE_min")
+            split_row["social_cvae_selector_latency_avg_ms"] = _num(
+                metrics.get("social_cvae_selector_pred_latency_avg_ms")
+            )
+            split_row["slow_latency_avg_ms"] = _num(metrics.get("slow_pred_latency_avg_ms"))
+            split_row["delta_l2_mean"] = _num(metrics.get("social_cvae_selector_delta_l2_mean"))
+            split_row["selected_index_mean"] = _num(metrics.get("social_cvae_selector_selected_index_mean"))
+            split_row["selected_mean_ratio"] = _num(metrics.get("social_cvae_selector_selected_mean_ratio"))
+        row[f"official_{split}"] = split_row
+    row["missing_files"] = missing
+    return row
+
+
+def _aggregate(rows: Sequence[Mapping[str, Any]], splits: Sequence[str]) -> Dict[str, Any]:
+    aggregate: Dict[str, Any] = {}
+    for split in splits:
+        key = f"official_{split}"
+        split_row: Dict[str, Any] = {
+            "available_official_seeds": sum(1 for row in rows if _num(row.get(key, {}).get("dFDE_min")) is not None)
+        }
+        for metric in METRICS:
+            split_row[f"mean_d{metric}"] = _mean(row.get(key, {}).get(f"d{metric}") for row in rows)
+        split_row["mean_delta_l2"] = _mean(row.get(key, {}).get("delta_l2_mean") for row in rows)
+        split_row["mean_selected_index"] = _mean(row.get(key, {}).get("selected_index_mean") for row in rows)
+        split_row["mean_selected_mean_ratio"] = _mean(row.get(key, {}).get("selected_mean_ratio") for row in rows)
+        split_row["mean_social_cvae_selector_latency_avg_ms"] = _mean(
+            row.get(key, {}).get("social_cvae_selector_latency_avg_ms") for row in rows
+        )
+        split_row["mean_slow_latency_avg_ms"] = _mean(row.get(key, {}).get("slow_latency_avg_ms") for row in rows)
+        aggregate[split] = split_row
+    return aggregate
+
+
+def _render(rows: Sequence[Mapping[str, Any]], aggregate: Mapping[str, Any], splits: Sequence[str]) -> str:
+    lines: List[str] = []
+    for row in rows:
+        lines.append(f"===== {row['run_id']} =====")
+        if row.get("missing_files"):
+            lines.append("missing summary inputs:")
+            for path in row["missing_files"]:
+                lines.append(f"  {path}")
+        lines.append(f"best_epoch: {row.get('best_epoch')}")
+        lines.append(f"best checkpoint: {row.get('best_checkpoint')}")
+        lines.append(f"refiner checkpoint: {row.get('refiner_checkpoint')}")
+        lines.append(f"best_selection_score: {row.get('best_selection_score')}")
+        lines.append(f"cache-val dFDE_min: {_fmt(row.get('cache_val_dFDE_min'), signed=True)}")
+        lines.append(f"cache-val dMissRate: {_fmt(row.get('cache_val_dMissRate'), signed=True)}")
+        lines.append(f"cache-val target_accuracy: {_fmt(row.get('cache_val_target_accuracy'))}")
+        lines.append(f"cache-val target_mean_ratio: {_fmt(row.get('cache_val_target_mean_ratio'))}")
+        lines.append(f"cache-val selected_mean_ratio: {_fmt(row.get('cache_val_selected_mean_ratio'))}")
+        lines.append(f"cache-val target_utility_gain: {_fmt(row.get('cache_val_target_utility_gain'))}")
+        lines.append("")
+        for split in splits:
+            official = row.get(f"official_{split}", {})
+            lines.append(f"-- official {split} SocialCVAESelector - Slow --")
+            for metric in METRICS:
+                lines.append(
+                    f"d{metric}: {_fmt(official.get(f'd{metric}'), signed=True)}  "
+                    f"social_cvae_selector={_fmt(official.get(f'social_cvae_selector_{metric}'))}  "
+                    f"slow={_fmt(official.get(f'slow_{metric}'))}"
+                )
+            lines.append(f"fast_FDE_min: {official.get('fast_FDE_min')}")
+            lines.append(f"social_cvae_selector_latency_avg_ms: {official.get('social_cvae_selector_latency_avg_ms')}")
+            lines.append(f"slow_latency_avg_ms: {official.get('slow_latency_avg_ms')}")
+            lines.append(f"delta_l2_mean: {official.get('delta_l2_mean')}")
+            lines.append(f"selected_index_mean: {official.get('selected_index_mean')}")
+            lines.append(f"selected_mean_ratio: {official.get('selected_mean_ratio')}")
+            lines.append("")
+    lines.append(f"===== MEAN DELTAS (requested={len(rows)}) =====")
+    for split in splits:
+        mean = aggregate.get(split, {})
+        lines.append("")
+        lines.append(f"-- {split} --")
+        lines.append(f"available official seeds: {int(mean.get('available_official_seeds') or 0)}/{len(rows)}")
+        for metric in METRICS:
+            lines.append(f"mean d{metric}: {_fmt(mean.get(f'mean_d{metric}'), signed=True)}")
+        lines.append(f"mean delta_l2: {_fmt(mean.get('mean_delta_l2'))}")
+        lines.append(f"mean selected_index: {_fmt(mean.get('mean_selected_index'))}")
+        lines.append(f"mean selected_mean_ratio: {_fmt(mean.get('mean_selected_mean_ratio'))}")
+        lines.append(
+            "mean social_cvae_selector_latency_avg_ms: "
+            f"{_fmt(mean.get('mean_social_cvae_selector_latency_avg_ms'))}"
+        )
+        lines.append(f"mean slow_latency_avg_ms: {_fmt(mean.get('mean_slow_latency_avg_ms'))}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    project_root = Path(args.project_root).expanduser().resolve()
+    seeds = _split_ints(args.seeds)
+    splits = _split_items(args.splits)
+    rows = [_seed_row(args, project_root, seed, splits) for seed in seeds]
+    aggregate = _aggregate(rows, splits)
+    payload = {
+        "meta": {
+            "script": "trustmoe_traj.scripts.summarize_social_cvae_selector",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_prefix": args.run_prefix,
+            "run_name": args.run_name,
+            "eval_file_prefix": args.eval_file_prefix,
+            "seeds": seeds,
+            "splits": splits,
+        },
+        "rows": rows,
+        "aggregate": aggregate,
+    }
+    default_root = project_root / "trustmoe_traj" / "analysis" / "experiment_runs" / args.run_prefix
+    output_json = Path(args.output_json).expanduser().resolve() if args.output_json else default_root / "aggregate_summary.json"
+    output_txt = Path(args.output_txt).expanduser().resolve() if args.output_txt else default_root / "aggregate_summary.txt"
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_txt.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    rendered = _render(rows, aggregate, splits)
+    output_txt.write_text(rendered, encoding="utf-8")
+    print(rendered)
+    print(f"summary_json={output_json.as_posix()}")
+    print(f"summary_txt={output_txt.as_posix()}")
+
+
+if __name__ == "__main__":
+    main()
